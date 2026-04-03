@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use reqwest::Url;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -16,8 +15,7 @@ fn main() {
         "released": Utc::now(),
     });
     let preview: ReleasePreview = serde_json::from_value(payload).expect("valid preview payload");
-    let docs = Url::parse("https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html")
-        .expect("valid URL");
+    let docs = "https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html";
 
     println!(
         "Example: `{}` was released at {}, see {} for details.",
