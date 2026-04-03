@@ -36,6 +36,7 @@ All behavior is driven by environment variables so you can tune it per invocatio
 
 - `COOLDOWN_MINUTES` (default `0`): minimum age, in minutes, for a release to be considered safe. The cooldown logic only runs when the value is greater than zero.
 - `COOLDOWN_MODE` (default `enforce`): switch to `warn` to log violations without failing, or `off` to skip cooldown logic temporarily.
+- `COOLDOWN_NOW`: optional RFC 3339 timestamp override used instead of the wall clock. This is mainly useful for deterministic tests and for reproducing a past resolution decision.
 - `COOLDOWN_ALLOWLIST_PATH`: path to a TOML allowlist that relaxes cooldowns for specific crates or pins exact versions. If unset, the tool looks for `cooldown-allowlist.toml` in the workspace root.
 - `COOLDOWN_TTL_SECONDS` (default `86400`): lifetime of cached registry responses.
 - `COOLDOWN_CACHE_DIR`: directory used to store cache files. By default the OS cache directory is used with a `cargo-cooldown/` suffix.
@@ -54,7 +55,7 @@ offline_ok = true
 registry_index = "https://mirror.example/index"
 ```
 
-The demo workspace under `examples/demo/` ships with a baseline `cooldown.toml`; the helper script `examples/test.sh` layers environment variables on top for each scenario, illustrating the precedence in practice.
+The demo workspace under `examples/demo/` ships with a baseline `cooldown.toml`; the smoke-test helper script `examples/smoke-test-crates-io.sh` layers environment variables on top for each scenario, illustrating the precedence in practice against the live registry. For repeatable regression checks, `examples/test.sh` uses a frozen timestamp, a committed lockfile fixture, and cached registry metadata snapshots. That deterministic suite intentionally sets `COOLDOWN_REGISTRY_API` to `http://127.0.0.1:9/`: no local server is started there, and the unreachable endpoint is used as a guardrail so every metadata lookup must be satisfied from the fixture cache. If a cache entry is missing, the test fails immediately instead of drifting back to live crates.io responses.
 
 ## CLI flags
 
@@ -71,7 +72,8 @@ The `examples/` directory contains material to explore the tool:
 
 - `demo/`: a small workspace with crates.io dependencies you can build with `cargo cooldown build` to watch downgrades in action.
 - `cooldown-allowlist.toml`: sample allowlist showing global and per crate overrides as well as exact exceptions.
-- `test.sh`: convenience script with ready made invocations that toggle the most relevant environment variables.
+- `test.sh`: deterministic regression suite that freezes time, reads registry metadata from committed cache fixtures, and diffs the resulting `Cargo.lock` against committed expectations.
+- `smoke-test-crates-io.sh`: non-deterministic smoke test with ready made invocations against the current crates.io state.
 
 You can try the full flow by running:
 

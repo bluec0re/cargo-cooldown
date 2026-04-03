@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use dirs::home_dir;
 use serde::Deserialize;
 
@@ -29,6 +30,7 @@ impl Mode {
 pub struct Config {
     pub cooldown_minutes: u64,
     pub mode: Mode,
+    pub now_override: Option<DateTime<Utc>>,
     pub ttl_seconds: u64,
     pub allowlist_path: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
@@ -58,6 +60,16 @@ impl Config {
                 .ok()
                 .or_else(|| file_config.as_ref().and_then(|cfg| cfg.data.mode.clone())),
         );
+
+        let now_override = env::var("COOLDOWN_NOW")
+            .ok()
+            .and_then(|value| parse_datetime(&value))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.data.now.clone())
+                    .and_then(|value| parse_datetime(&value))
+            });
 
         let ttl_seconds = env::var("COOLDOWN_TTL_SECONDS")
             .ok()
@@ -125,6 +137,7 @@ impl Config {
         Self {
             cooldown_minutes,
             mode,
+            now_override,
             ttl_seconds,
             allowlist_path,
             cache_dir,
@@ -174,6 +187,12 @@ fn parse_bool(value: &str) -> bool {
     value == "1" || value.eq_ignore_ascii_case("true")
 }
 
+fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|parsed| parsed.with_timezone(&Utc))
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct RawFileConfig {
@@ -181,6 +200,8 @@ struct RawFileConfig {
     cooldown_minutes: Option<u64>,
     #[serde(alias = "COOLDOWN_MODE")]
     mode: Option<String>,
+    #[serde(alias = "COOLDOWN_NOW")]
+    now: Option<String>,
     #[serde(alias = "COOLDOWN_ALLOWLIST_PATH")]
     allowlist_path: Option<PathBuf>,
     #[serde(alias = "COOLDOWN_TTL_SECONDS")]
@@ -370,6 +391,21 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn cooldown_now_parses_rfc3339_override() {
+        with_env_var("COOLDOWN_NOW", Some("2026-04-03T00:00:00Z"), || {
+            let config = Config::from_env();
+            assert_eq!(
+                config.now_override,
+                Some(
+                    DateTime::parse_from_rfc3339("2026-04-03T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc)
+                )
+            );
+        });
     }
 
     #[test]

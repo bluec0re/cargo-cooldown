@@ -1,0 +1,3 @@
+[[allow.exact]]
+crate = "itoa"
+version = "1.0.18"

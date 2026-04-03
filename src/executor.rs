@@ -53,7 +53,7 @@ pub async fn run_pinning_flow(
             name_version_to_id.insert((pkg.name.to_string(), pkg.version.to_string()), id.clone());
         }
 
-        let now = Utc::now();
+        let now = config.now_override.unwrap_or_else(Utc::now);
         let mut crate_states: HashMap<PackageId, CrateState> = HashMap::new();
         let mut fresh_entries: Vec<FreshCrate> = Vec::new();
         let mut equality_dependents: HashMap<PackageId, Vec<PackageId>> = HashMap::new();
@@ -661,6 +661,7 @@ mod tests {
         Config {
             cooldown_minutes: 60,
             mode: Mode::Enforce,
+            now_override: None,
             ttl_seconds: 60,
             allowlist_path: None,
             cache_dir: None,
