@@ -1,86 +1,189 @@
 # cargo-cooldown
 
-`cargo-cooldown` is a lightweight wrapper for Cargo that shields local workspaces from freshly published crates on crates.io. It enforces a configurable cooldown window before new releases can enter your dependency graph, buying time for review and reducing a common supply chain risk. **`cargo-cooldown` is a proof of concept for local development.** Use it in day-to-day workflows where you refresh dependencies and immediately rebuild or run the project. CI pipelines and release automation should continue to run plain Cargo against committed `Cargo.lock` files.
+`cargo-cooldown` is a Cargo wrapper that delays adoption of freshly published
+registry crate versions. It lets Cargo resolve the graph, then replaces fresh
+versions with the newest older compatible versions that Cargo still accepts.
 
-## Why it exists
+Use it when you want dependency updates, but do not want your lockfile to pick
+up releases that were published too recently.
 
-Attackers can push brand new crates or updates that satisfy permissive semver ranges. Installing them right away means your project might consume malicious code before the ecosystem can react. By delaying adoption, `cargo-cooldown` keeps you on the most recent release that is older than the cooldown window you configure. Socket covers this threat model in their report on [crates.io phishing campaigns](https://socket.dev/blog/crates-io-users-targeted-by-phishing-emails).
+## Quick Start
 
-## Quick start
+Install:
 
-1. Install:
-   ```bash
-   cargo install --locked cargo-cooldown
-   ```
-2. Explore the CLI and the flags that mirror Cargo’s selectors:
-   ```bash
-   cargo cooldown --help
-   ```
-3. Expect the tool to pin your graph if a dependency is too fresh. It will search for the newest compliant version, run `cargo update --precise`, refresh metadata, and then re-invoke your command. Tune the behaviour via environment variables like `COOLDOWN_MINUTES` or with a `cooldown.toml` file; see the configuration section for the full reference.
+```bash
+cargo install --locked cargo-cooldown
+```
 
-## How it works
+Create a project config:
 
-1. `cargo-cooldown` ensures a `Cargo.lock` file exists, generating one with `cargo generate-lockfile` if needed.
-2. It calls `cargo metadata` to read the full dependency graph and records every `VersionReq` that parents impose on their children.
-3. For each crate sourced from a watched registry, it fetches publication metadata from the crates.io HTTP API through a small on-disk cache and computes the package age. Allowlist rules can lower the effective cooldown per crate or globally, but they never raise it above the baseline from `COOLDOWN_MINUTES`.
-4. Every crate younger than the effective cooldown enters a queue. The queue gives priority to nodes that might drag others with strict `=` constraints so related packages can be updated together.
-5. Candidate versions are filtered so they are not yanked, satisfy every observed semver requirement, are older than the current lockfile entry, and were published before the cutoff timestamp.
-6. Each candidate is attempted via `cargo update -p crate@<current_version> --precise <candidate_version>`. If Cargo rejects the change, the blocking crates are added back to the queue unless they are exempt through the allowlist.
-7. After a successful downgrade, the tool repeats the cycle until the graph contains only releases older than the cooldown window. When no acceptable candidate exists, the run aborts with a clear error so you can wait, loosen the requirement, or patch it manually.
+```bash
+cargo cooldown init
+```
 
-> Note: today the publication timestamp comes from the crates.io API. Once that data is shipped with the index metadata, those network calls can be replaced with local lookups.
+Run a Cargo command through cooldown:
 
-## Configuration
+```bash
+cargo cooldown check
+```
 
-All behavior is driven by environment variables so you can tune it per invocation or in scripts:
+`check`, `build`, `test`, and `run` are guard-style commands: cooldown runs a
+pre-command lockfile pass before Cargo downloads, compiles, tests, or runs code
+from the dependency graph. With the default `lockfile_baseline = "floor"`,
+versions already present in the initial `Cargo.lock` are treated as the
+protected baseline; use `lockfile_baseline = "ignore"` when these commands
+should also try to cool already-locked versions before Cargo consumes them.
 
-- `COOLDOWN_MINUTES` (default `0`): minimum age, in minutes, for a release to be considered safe. The cooldown logic only runs when the value is greater than zero.
-- `COOLDOWN_MODE` (default `enforce`): switch to `warn` to log violations without failing, or `off` to skip cooldown logic temporarily.
-- `COOLDOWN_NOW`: optional RFC 3339 timestamp override used instead of the wall clock. This is mainly useful for deterministic tests and for reproducing a past resolution decision.
-- `COOLDOWN_ALLOWLIST_PATH`: path to a TOML allowlist that relaxes cooldowns for specific crates or pins exact versions. If unset, the tool looks for `cooldown-allowlist.toml` in the workspace root.
-- `COOLDOWN_TTL_SECONDS` (default `86400`): lifetime of cached registry responses.
-- `COOLDOWN_CACHE_DIR`: directory used to store cache files. By default the OS cache directory is used with a `cargo-cooldown/` suffix.
-- `COOLDOWN_OFFLINE_OK` (default `false`): when true, missing network calls are tolerated and only cached data is used.
-- `COOLDOWN_HTTP_RETRIES` (default `2`, max `8`): retry budget for API requests.
-- `COOLDOWN_VERBOSE` (default `false`): enable extra tracing output to see resolution decisions.
-- `COOLDOWN_REGISTRY_API` (default `https://crates.io/api/v1/`): override the API base if you mirror crates.io.
-- `COOLDOWN_REGISTRY_INDEX` (default `registry+https://github.com/rust-lang/crates.io-index, registry+sparse+https://index.crates.io/`): comma separated list of registry sources. Values without the `registry+` prefix are normalized automatically. Dependencies from other registries are left untouched.
+Update dependencies under cooldown:
 
-For repeatable settings you can also create a `cooldown.toml` file. Place it in the workspace root to scope it to a project, or in `$CARGO_HOME/cooldown.toml` to apply it globally. When `CARGO_HOME` is not set, the fallback remains `~/.cargo/cooldown.toml`. Following the convention used by Cargo configuration, keys should be written in `snake_case`; uppercase keys mirroring the environment variables remain supported for compatibility. Environment variables always win over file values, so scripts can override temporary tweaks without editing the config. Paths such as `allowlist_path` or `cache_dir` can be expressed relative to the file location.
+```bash
+cargo cooldown update
+```
+
+`update` is the lockfile-refresh command: Cargo resolves the newest graph first,
+then cooldown cools the updated lockfile before it is kept.
+
+`cargo cooldown init` is cargo-cooldown's setup wizard. To create a new Cargo
+package, use Cargo's own command:
+
+```bash
+cargo init
+```
+
+## Basic Config
+
+`cooldown.toml` usually starts with:
 
 ```toml
 cooldown_minutes = 1440
-mode = "warn"
-offline_ok = true
-registry_index = "https://mirror.example/index"
+enforcement = "cargo_compatible"
+cargo_compatible_accept = "prompt"
+lockfile_baseline = "floor"
 ```
 
-The demo workspace under `examples/demo/` ships with a baseline `cooldown.toml`; the smoke-test helper script `examples/smoke-test-crates-io.sh` layers environment variables on top for each scenario, illustrating the precedence in practice against the live registry. For repeatable regression checks, `examples/test.sh` uses a frozen timestamp, a committed lockfile fixture, and cached registry metadata snapshots. That deterministic suite intentionally sets `COOLDOWN_REGISTRY_API` to `http://127.0.0.1:9/`: no local server is started there, and the unreachable endpoint is used as a guardrail so every metadata lookup must be satisfied from the fixture cache. If a cache entry is missing, the test fails immediately instead of drifting back to live crates.io responses.
+Meaning:
 
-## CLI flags
+- `cooldown_minutes`: how old a release must be before cooldown accepts it
+- `enforcement`: what to do if Cargo still requires fresh versions
+- `cargo_compatible_accept`: whether to prompt before accepting fresh versions
+  Cargo still requires
+- `lockfile_baseline`: whether the initial `Cargo.lock` is used as a version
+  floor
 
-`cargo-cooldown` uses [`clap`](https://docs.rs/clap/latest/clap/) together with [`clap-cargo`](https://docs.rs/clap-cargo/latest/clap_cargo/) so you can reuse familiar Cargo selectors before passing control to the underlying command. Flags such as `--manifest-path`, `--package`, `--workspace`, `--exclude`, `--features`, `--all-features`, and `--no-default-features` are parsed locally and then forwarded to the Cargo invocation. Everything after the first positional argument is treated as the command to execute.
+Config is loaded in this order, from strongest to weakest:
 
-```bash
-cargo cooldown --manifest-path examples/demo/Cargo.toml --package demo build
-cargo cooldown --features "demo,extra" test -- --nocapture
+1. environment variables
+2. active member `cooldown.toml`, when exactly one workspace member is targeted
+3. workspace or crate root `cooldown.toml`
+4. `$CARGO_HOME/cooldown.toml`
+
+## `enforcement` vs `lockfile_baseline`
+
+These settings answer different questions:
+
+- `lockfile_baseline` controls whether cooldown may go below versions already
+  present in the initial `Cargo.lock`.
+- `enforcement` controls what happens if Cargo still requires fresh versions.
+
+`lockfile_baseline = "ignore"` is not a force setting. Cargo still validates the
+final graph, so cooldown never writes a lockfile that Cargo rejects.
+
+| Configuration | Meaning |
+| --- | --- |
+| `lockfile_baseline = "floor"` + `enforcement = "cargo_compatible"` | `cargo cooldown init` default. Use the pre-run lockfile as the minimum version floor, keep the best Cargo-valid lockfile if some fresh versions remain, and warn. |
+| `lockfile_baseline = "floor"` + `enforcement = "strict"` | Fail-closed policy. Use the pre-run lockfile as the minimum version floor. If any new fresh version remains, fail and restore the original `Cargo.lock`. |
+| `lockfile_baseline = "ignore"` + `enforcement = "strict"` | Try to cool every eligible locked registry package, including versions already present before the run. If any fresh version still cannot be cooled, fail and restore the original `Cargo.lock`. |
+| `lockfile_baseline = "ignore"` + `enforcement = "cargo_compatible"` | Most permissive update policy. Try to cool everything, keep Cargo's best valid result, and warn about any remaining fresh versions. |
+
+A fresh version can remain when the current `Cargo.toml` graph requires it. That
+can happen because of semver ranges, exact dependencies, feature-selected
+dependencies, target-specific dependencies, or a group of crates that does not
+have an older compatible combination.
+
+`enforcement = "cargo_compatible"` is flexible only where Cargo requires a fresh
+version. It still cools every package Cargo can accept and reports the remaining
+fresh versions so you can review the supply-chain risk.
+
+By default, `cargo_compatible` asks before accepting unresolved fresh versions.
+Use `cargo_compatible_accept = "auto"` only when you want the previous
+non-interactive behavior.
+
+## Allow Rules
+
+Allow rules live in `cooldown.toml`:
+
+```toml
+[[allow.exact]]
+crate = "serde"
+version = "1.0.218"
+
+[[allow.package]]
+crate = "tokio"
+minutes = 60
+
+[[allow.package]]
+crate = "openssl"
+minutes = 0
 ```
+
+Use:
+
+- `[[allow.exact]]` to allow one exact crate version
+- `[[allow.package]]` to use a shorter cooldown for one crate
+- `minutes = 0` to exclude one crate from cooldown
+
+Allow rules only reduce the effective cooldown window. They do not make a crate
+wait longer than `cooldown_minutes`.
+
+## Registries
+
+Cargo's registry configuration is the source of truth. `cargo-cooldown` reads
+release timestamps from the local registry index first and uses registry HTTP
+fallback only when local `pubtime` is missing.
+
+Skip a registry completely:
+
+```toml
+skip_registries = ["crates-io", "sparse+https://example.com/index/"]
+```
+
+Skipped registries are not inspected or downgraded, but their packages still
+shape Cargo's dependency graph.
+
+## Workspaces
+
+Recommended layout:
+
+- one shared `cooldown.toml` at the workspace root
+- optional `member/cooldown.toml` overrides only for member-specific runs
+
+Member overrides apply only when the command targets exactly one member.
+
+## Docs
+
+- [Overview](docs/overview.md)
+- [Configuration](docs/configuration.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Registries](docs/registries.md)
+- [Resolution Flow](docs/resolution-flow.md)
+- [Migration Guide](docs/migration-guide.md)
+- [Testing](docs/testing.md)
 
 ## Examples
 
-The `examples/` directory contains material to explore the tool:
+- `examples/crates-io-smoke-workspace/`: small crates.io-backed smoke workspace
+- `examples/crates-io-large-benchmark-workspace/`: larger benchmark workspace
+- `examples/run-crates-io-smoke.sh`: manual smoke checks
+- `examples/run-crates-io-benchmark.sh`: shared benchmark runner
 
-- `demo/`: a small workspace with crates.io dependencies you can build with `cargo cooldown build` to watch downgrades in action.
-- `cooldown-allowlist.toml`: sample allowlist showing global and per crate overrides as well as exact exceptions.
-- `test.sh`: deterministic regression suite that freezes time, reads registry metadata from committed cache fixtures, and diffs the resulting `Cargo.lock` against committed expectations.
-- `smoke-test-crates-io.sh`: non-deterministic smoke test with ready made invocations against the current crates.io state.
+Run the large benchmark:
 
-You can try the full flow by running:
+```bash
+cargo bench --bench crates_io_cooldown -- --scenario large-60d
+```
 
-1. `cd examples/demo`
-2. `COOLDOWN_MINUTES=1440 cargo cooldown build`
-3. Inspect the output, tweak the allowlist or environment variables, and run again to see how the graph changes.
+## Status
 
-## Feedback
-
-`cargo-cooldown` is still an experiment, and we’re learning alongside you. Tried it out? Let us know what feels helpful, what gets in the way. Real-world stories and issue reports make the project better.
+`cargo-cooldown` is intended for local development workflows where you refresh
+dependencies and build immediately. CI pipelines and release automation should
+usually use plain Cargo against committed `Cargo.lock` files.

@@ -1,0 +1,89 @@
+# Changelog
+
+## 0.3.0 - 2026-04-26
+
+This is an intentionally breaking release.
+
+Migration guide:
+
+- [Migration Guide](docs/migration-guide.md)
+
+### Added
+
+- multi-registry support for Cargo registries, mirrors, and source replacements
+- index-first release-time resolution from Cargo's local registry cache
+- per-crate HTTP fallback when `pubtime` is missing
+- explicit `skip_registries` / `COOLDOWN_SKIP_REGISTRIES`
+- explicit `lockfile_baseline` / `COOLDOWN_LOCKFILE_BASELINE` to choose between
+  using the initial lockfile as a version floor or ignoring that floor
+- explicit `enforcement` / `COOLDOWN_ENFORCEMENT` to choose strict rollback,
+  Cargo-compatible warnings, or fully disabled cooldown
+- explicit `cargo_compatible_accept` / `COOLDOWN_CARGO_COMPATIBLE_ACCEPT` to
+  choose prompt-based review or automatic acceptance for unresolved fresh
+  versions under Cargo-compatible enforcement
+- `cargo cooldown update` to refresh the lockfile first and then cool only the
+  versions that changed relative to the pre-update baseline
+- `cargo cooldown init` to scaffold `cooldown.toml` interactively for crates
+  and workspaces
+- new integration tests in `./tests`
+- new documentation under `./docs`
+
+### Changed
+
+- configuration now lives in a single `cooldown.toml`, with allow rules under
+  the embedded `allow` section
+- resolver now works from a single release timeline per crate
+- cooldown now follows Cargo's effective registry configuration instead of a
+  separate registry routing layer
+- cooldown now snapshots the initial `Cargo.lock` once per execution and, by
+  default, skips registry versions that were already present in that baseline
+- cooldown now respects Cargo workspace selectors so package-scoped runs only
+  cool the selected workspace members and their dependency closure
+- config discovery now starts from the effective Cargo root, with optional
+  member overrides only for uniquely targeted workspace members
+- repeated outer-loop scans now reuse in-memory registry timelines and locked
+  version age inspections within one cooldown execution
+- missing release-time metadata is fail-closed under `strict` enforcement and
+  downgraded to warnings only under `cargo_compatible` enforcement
+- `cargo_compatible` now prompts before accepting resolver-constrained fresh
+  versions unless `cargo_compatible_accept = "auto"` is configured
+- cooldown now resolves and cools lockfiles in a temporary workspace, holding
+  the real root `Cargo.lock` with a backup plus sentinel until the final
+  Cargo-valid lockfile is ready to publish
+- `verbose = true` / `COOLDOWN_VERBOSE=true` now surfaces cooldown internals as
+  `DEBUG` logs while keeping user-facing `INFO`/`WARN` output compact
+
+### Breaking changes
+
+Configuration, registry discovery, allow rules, lockfile baseline handling, and
+enforcement names changed in this release. See the
+[Migration Guide](docs/migration-guide.md) for the upgrade steps.
+
+### Fixed
+
+- reduced dependency on crates.io HTTP metadata when the local index already
+  contains `pubtime`
+- clearer distinction between registries that are skipped and registries that
+  fail because metadata is incomplete
+- cooldown now restores the original `Cargo.lock` if Cargo re-resolves during
+  inspection and the cooldown run ultimately fails
+- `lockfile_baseline = "floor"` now allows `cargo cooldown update` to pin a
+  freshly updated crate back to an exact version from the initial baseline,
+  even when that baseline version is still inside the cooldown window
+- cooldown now treats blockers or parent constraints that were already
+  exhausted earlier in the run as cargo-compatible skips instead of failing
+  later with a generic fixed-point error
+- cooldown now emits a single final warning when fresh versions remain,
+  distinguishing baseline-carried versions from resolver-constrained ones, and
+  `strict` enforcement now turns remaining resolver-constrained fresh versions
+  into a rollback error instead of allowing them through
+- cooldown now makes one bounded coordinated bundle attempt for small
+  resolver-constrained groups, which helps cool tightly coupled crates such as
+  `js-sys` / `wasm-bindgen*` / `web-sys` when individual pins cannot progress
+- successful `cargo cooldown update` runs now keep the initial `cargo update`
+  chatter hidden, so user-facing output stays focused on cooldown results
+- `--manifest-path` is now honored during both cooldown inspection and
+  `cargo update --precise` pinning, including runs started from another cwd
+- Cargo-style selectors such as `--manifest-path`, `--package`, `--workspace`,
+  `--exclude`, and feature flags are now parsed correctly even when passed
+  after the forwarded Cargo subcommand
