@@ -53,6 +53,7 @@ enum CargoCli {
     #[command(
         name = "cooldown",
         about = "Cargo wrapper that enforces a cooldown window for freshly published registry crates.",
+        after_help = "Any other Cargo command is also forwarded through cooldown.",
         disable_help_subcommand = true,
         arg_required_else_help = true,
         styles = clap_cargo::style::CLAP_STYLING
@@ -70,6 +71,8 @@ struct Cli {
     features: Features,
     #[command(subcommand)]
     command: CooldownCommand,
+    #[arg(skip)]
+    forwarded_cargo_args: Vec<OsString>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -79,8 +82,92 @@ enum CooldownCommand {
         long_about = "Initialize cooldown.toml in the current project root.\n\nThis is cargo-cooldown's setup wizard, not Cargo's `cargo init`. Use plain `cargo init` to create a new package."
     )]
     Init,
+    #[command(about = "Print cargo-cooldown's version.")]
+    Version,
+    #[command(
+        about = "Cool the dependency graph, then run `cargo check`.",
+        disable_help_flag = true
+    )]
+    Check {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    #[command(
+        about = "Cool the dependency graph, then run `cargo build`.",
+        disable_help_flag = true
+    )]
+    Build {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    #[command(
+        about = "Cool the dependency graph, then run `cargo test`.",
+        disable_help_flag = true
+    )]
+    Test {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    #[command(
+        about = "Cool the dependency graph, then run `cargo run`.",
+        disable_help_flag = true
+    )]
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    #[command(
+        about = "Run `cargo update`, then cool the updated dependency graph.",
+        disable_help_flag = true
+    )]
+    Update {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     #[command(external_subcommand)]
     Cargo(Vec<OsString>),
+}
+
+impl CooldownCommand {
+    fn cargo_args(&self, raw_cargo_args: &[OsString]) -> Option<Vec<OsString>> {
+        match self {
+            Self::Init | Self::Version => None,
+            Self::Check { args } => Some(preserved_cargo_args("check", args, raw_cargo_args)),
+            Self::Build { args } => Some(preserved_cargo_args("build", args, raw_cargo_args)),
+            Self::Test { args } => Some(preserved_cargo_args("test", args, raw_cargo_args)),
+            Self::Run { args } => Some(preserved_cargo_args("run", args, raw_cargo_args)),
+            Self::Update { args } => Some(preserved_cargo_args("update", args, raw_cargo_args)),
+            Self::Cargo(args) => {
+                if raw_cargo_args.is_empty() {
+                    Some(args.clone())
+                } else {
+                    Some(raw_cargo_args.to_vec())
+                }
+            }
+        }
+    }
+}
+
+fn preserved_cargo_args(
+    command: &str,
+    clap_args: &[OsString],
+    raw_cargo_args: &[OsString],
+) -> Vec<OsString> {
+    if raw_cargo_args
+        .first()
+        .is_some_and(|arg| arg.to_str() == Some(command))
+    {
+        raw_cargo_args.to_vec()
+    } else {
+        named_cargo_args(command, clap_args)
+    }
+}
+
+fn named_cargo_args(command: &str, args: &[OsString]) -> Vec<OsString> {
+    let mut cargo_args = Vec::with_capacity(args.len() + 1);
+    cargo_args.push(OsString::from(command));
+    cargo_args.extend(args.iter().cloned());
+    cargo_args
 }
 
 fn init_logging(verbose: bool) {
@@ -104,6 +191,11 @@ fn init_logging(verbose: bool) {
 /// command state used by the rest of the program.
 fn parse_cli(raw_args: &[OsString]) -> Cli {
     let user_args = raw_user_args(raw_args);
+    if is_top_level_version_request(user_args) {
+        println!("cargo-cooldown {}", env!("CARGO_PKG_VERSION"));
+        exit_with(0);
+    }
+
     let (_, cargo_args) = hoist_cargo_selectors(user_args);
     if init_looks_like_forwarded_cargo_init(&cargo_args) {
         eprintln!(
@@ -114,7 +206,10 @@ fn parse_cli(raw_args: &[OsString]) -> Cli {
     }
 
     match CargoCli::try_parse_from(normalize_cli_args(raw_args)) {
-        Ok(CargoCli::Cooldown(cli)) => cli,
+        Ok(CargoCli::Cooldown(mut cli)) => {
+            cli.forwarded_cargo_args = cargo_args;
+            cli
+        }
         Err(err) => err.exit(),
     }
 }
@@ -213,6 +308,13 @@ fn is_top_level_help_flag(value: &str) -> bool {
     matches!(value, "-h" | "--help")
 }
 
+fn is_top_level_version_request(args: &[OsString]) -> bool {
+    matches!(
+        args,
+        [arg] if matches!(arg.to_str(), Some("-V" | "--version"))
+    )
+}
+
 fn init_looks_like_forwarded_cargo_init(cargo_args: &[OsString]) -> bool {
     matches!(
         cargo_args.first().and_then(|value| value.to_str()),
@@ -256,6 +358,20 @@ fn is_update_command(cargo_args: &[OsString]) -> bool {
         cargo_args.first().and_then(|value| value.to_str()),
         Some("update")
     )
+}
+
+fn is_cargo_help_request(cargo_args: &[OsString]) -> bool {
+    if matches!(
+        cargo_args.first().and_then(|value| value.to_str()),
+        Some("help")
+    ) {
+        return true;
+    }
+
+    cargo_args
+        .iter()
+        .take_while(|arg| arg.to_str() != Some("--"))
+        .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
 }
 
 /// Canonicalize the Cargo invocation so the subcommand leads and the selectors
@@ -481,18 +597,30 @@ fn main() -> Result<()> {
             init::run(&project)?;
             Ok(())
         }
-        CooldownCommand::Cargo(cargo_args) => {
-            let project = ProjectContext::discover_for_runtime(&cli.manifest, &cli.workspace)?;
-            let config = config::Config::load(&project)?;
-            init_logging(config.verbose);
-
-            let forwarded_args = assemble_cargo_args(&cli, cargo_args);
+        CooldownCommand::Version => {
+            println!("cargo-cooldown {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        command => {
+            let cargo_args = command
+                .cargo_args(&cli.forwarded_cargo_args)
+                .expect("non-wrapper command should provide Cargo args");
+            let forwarded_args = assemble_cargo_args(&cli, &cargo_args);
             if forwarded_args.is_empty() {
                 eprintln!("Usage: cargo cooldown <cargo-command> [args...]");
                 exit_with(2);
             }
 
-            if is_update_command(cargo_args) {
+            if is_cargo_help_request(&forwarded_args) {
+                let status = Command::new("cargo").args(&forwarded_args).status()?;
+                exit_with(status.code().unwrap_or(1));
+            }
+
+            let project = ProjectContext::discover_for_runtime(&cli.manifest, &cli.workspace)?;
+            let config = config::Config::load(&project)?;
+            init_logging(config.verbose);
+
+            if is_update_command(&cargo_args) {
                 let phase = PhaseStatus::new(config.verbose);
                 match run_update_with_cooldown_isolation(
                     &config,
@@ -542,8 +670,10 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         CooldownCommand, assemble_cargo_args, init_looks_like_forwarded_cargo_init,
-        init_uses_runtime_selectors, is_update_command, parse_cli, split_features,
+        init_uses_runtime_selectors, is_cargo_help_request, is_update_command, parse_cli,
+        split_features,
     };
+    use clap::CommandFactory;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -558,9 +688,25 @@ mod tests {
     }
 
     fn cargo_args(cli: &super::Cli) -> Vec<OsString> {
-        match &cli.command {
-            CooldownCommand::Cargo(args) => args.clone(),
-            CooldownCommand::Init => Vec::new(),
+        cli.command
+            .cargo_args(&cli.forwarded_cargo_args)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn help_lists_documented_commands() {
+        let mut command = super::CargoCli::command();
+        let help = command
+            .find_subcommand_mut("cooldown")
+            .expect("cooldown subcommand should exist")
+            .render_help()
+            .to_string();
+
+        for expected in ["init", "version", "check", "build", "test", "run", "update"] {
+            assert!(
+                help.contains(&format!("  {expected}")),
+                "help should list `{expected}`:\n{help}"
+            );
         }
     }
 
@@ -631,10 +777,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_preserves_wrapped_command_help_for_cargo() {
+        for (raw, expected) in [
+            (
+                &["cargo-cooldown", "cooldown", "check", "--help"][..],
+                &["check", "--help"][..],
+            ),
+            (
+                &["cargo-cooldown", "cooldown", "build", "-h"][..],
+                &["build", "-h"][..],
+            ),
+            (
+                &["cargo-cooldown", "cooldown", "update", "--help"][..],
+                &["update", "--help"][..],
+            ),
+            (
+                &["cargo-cooldown", "cooldown", "help", "check"][..],
+                &["help", "check"][..],
+            ),
+        ] {
+            let cli = parse_cli(&to_os_vec(raw));
+            let forwarded = assemble_cargo_args(&cli, &cargo_args(&cli));
+            assert_eq!(to_string_vec(&forwarded), expected);
+            assert!(is_cargo_help_request(&forwarded));
+        }
+    }
+
+    #[test]
+    fn cargo_help_detection_ignores_args_after_double_dash() {
+        let args = to_os_vec(&["test", "--", "--help"]);
+        assert!(!is_cargo_help_request(&args));
+    }
+
+    #[test]
     fn parse_detects_init_subcommand() {
         let raw = to_os_vec(&["cargo-cooldown", "cooldown", "init"]);
         let cli = parse_cli(&raw);
         assert!(matches!(cli.command, CooldownCommand::Init));
+    }
+
+    #[test]
+    fn parse_detects_version_subcommand() {
+        let raw = to_os_vec(&["cargo-cooldown", "cooldown", "version"]);
+        let cli = parse_cli(&raw);
+        assert!(matches!(cli.command, CooldownCommand::Version));
+        assert!(cargo_args(&cli).is_empty());
     }
 
     #[test]
