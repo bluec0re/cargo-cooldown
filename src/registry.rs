@@ -21,7 +21,7 @@ use tame_index::utils::canonicalize_url;
 use tame_index::{IndexKrate, PathBuf as TamePathBuf};
 
 use crate::cache::Cache;
-use crate::config::Config;
+use crate::config::{Config, RegistryMinPublishAgeOverride};
 
 const CRATES_IO_LEGACY_SOURCE_ID: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SPARSE_SOURCE_ID: &str = "sparse+https://index.crates.io/";
@@ -163,7 +163,7 @@ impl RegistryStore {
 
     /// Resolve a Cargo metadata source ID into the effective registry context.
     ///
-    /// Cargo may report legacy, sparse, mirrored, or replacement registry URLs.
+    /// Cargo may report git-index, sparse, mirrored, or replacement registry URLs.
     /// This function normalizes that input, finds the local index location and
     /// optional API endpoint, applies `skip_registries`, and caches the result for
     /// later timeline or checksum lookups.
@@ -610,8 +610,102 @@ fn skip_registry_matches(
     Ok(normalized == normalized_source_id || normalized == normalized_effective_index_url)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RegistryOverrideMatchPriority {
+    ResolvedName = 1,
+    LogicalName = 2,
+    ExplicitIndex = 3,
+}
+
+pub fn registry_override_match_priority(
+    override_config: &RegistryMinPublishAgeOverride,
+    context: &RegistryContext,
+) -> Result<Option<RegistryOverrideMatchPriority>> {
+    let normalized_source_id = normalize_registry_identifier(&context.source_id)?;
+    let normalized_effective_index_url =
+        normalize_registry_identifier(&context.effective_index_url)?;
+
+    if let Some(index) = override_config.index.as_deref() {
+        let normalized_index = normalize_registry_identifier(index)?;
+        return Ok((normalized_index == normalized_source_id
+            || normalized_index == normalized_effective_index_url)
+            .then_some(RegistryOverrideMatchPriority::ExplicitIndex));
+    }
+
+    if override_config
+        .name
+        .eq_ignore_ascii_case(context.logical_name.as_str())
+        || (override_config.name_from_env
+            && override_config.name == cargo_env_registry_name(&context.logical_name))
+    {
+        return Ok(Some(RegistryOverrideMatchPriority::LogicalName));
+    }
+
+    if override_config.name_from_env {
+        return env_registry_override_match_priority(
+            &override_config.name,
+            context.logical_name == "crates-io",
+            &normalized_source_id,
+            &normalized_effective_index_url,
+        );
+    }
+
+    let matches = skip_registry_matches(
+        &override_config.name,
+        context.logical_name == "crates-io",
+        &normalized_source_id,
+        &normalized_effective_index_url,
+        cargo_config_root(),
+    )?;
+    Ok(matches.then_some(RegistryOverrideMatchPriority::ResolvedName))
+}
+
+fn env_registry_override_match_priority(
+    env_name: &str,
+    is_crates_io: bool,
+    normalized_source_id: &str,
+    normalized_effective_index_url: &str,
+) -> Result<Option<RegistryOverrideMatchPriority>> {
+    match skip_registry_matches(
+        env_name,
+        is_crates_io,
+        normalized_source_id,
+        normalized_effective_index_url,
+        cargo_config_root(),
+    ) {
+        Ok(matches) => Ok(matches.then_some(RegistryOverrideMatchPriority::ResolvedName)),
+        Err(raw_err) => {
+            let dashed_name = env_name.replace('_', "-");
+            if dashed_name == env_name {
+                return Err(raw_err);
+            }
+
+            let matches = skip_registry_matches(
+                &dashed_name,
+                is_crates_io,
+                normalized_source_id,
+                normalized_effective_index_url,
+                cargo_config_root(),
+            )
+            .map_err(|_| raw_err)?;
+            Ok(matches.then_some(RegistryOverrideMatchPriority::ResolvedName))
+        }
+    }
+}
+
+pub fn validate_registry_override_index(index: &str) -> Result<()> {
+    if !looks_like_registry_identifier(index.trim()) {
+        bail!("registry override index must be a registry URL or source ID");
+    }
+    normalize_registry_identifier(index).map(|_| ())
+}
+
 fn looks_like_registry_identifier(value: &str) -> bool {
     value.starts_with("registry+") || value.starts_with("sparse+") || value.contains("://")
+}
+
+fn cargo_env_registry_name(logical_name: &str) -> String {
+    logical_name.to_ascii_lowercase().replace('-', "_")
 }
 
 fn is_crates_io_source_id(source_id: &str) -> bool {
@@ -707,6 +801,11 @@ pub fn ensure_timeline_available(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allow_rules::AllowRules;
+    use crate::config::{
+        Config, FallbackAccept, IncompatiblePublishAgePolicy, LockfileBaselineMode,
+        RegistryMinPublishAgeConfig,
+    };
     use chrono::TimeZone;
     use std::fs;
     use tame_index::IndexVersion;
@@ -833,6 +932,143 @@ mod tests {
                 root
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn crates_io_min_publish_age_override_wins_over_global() {
+        let context = RegistryContext {
+            logical_name: "crates-io".to_string(),
+            source_id: CRATES_IO_LEGACY_SOURCE_ID.to_string(),
+            effective_index_url: "https://github.com/rust-lang/crates.io-index".to_string(),
+            api: None,
+            cache_fingerprint: "test".to_string(),
+            skipped: false,
+            index_root: TamePathBuf::new(),
+        };
+        let config = Config {
+            min_publish_age_seconds: 14 * 24 * 60 * 60,
+            registry_min_publish_age: RegistryMinPublishAgeConfig {
+                crates_io_seconds: Some(5 * 24 * 60 * 60),
+                registries: Vec::new(),
+            },
+            incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+            fallback_accept: FallbackAccept::Prompt,
+            lockfile_baseline: LockfileBaselineMode::Floor,
+            now_override: None,
+            ttl_seconds: 60,
+            cache_dir: None,
+            http_retries: 0,
+            verbose: false,
+            skip_registries: Vec::new(),
+            allow_rules: AllowRules::default(),
+        };
+
+        assert_eq!(
+            config
+                .min_publish_age_seconds_for(&context, "serde")
+                .unwrap(),
+            5 * 24 * 60 * 60
+        );
+    }
+
+    #[test]
+    fn explicit_index_registry_override_wins_over_name_match_regardless_of_order() {
+        let context = RegistryContext {
+            logical_name: "cool-reg".to_string(),
+            source_id: "sparse+https://example.com/index/".to_string(),
+            effective_index_url: "sparse+https://example.com/index/".to_string(),
+            api: None,
+            cache_fingerprint: "test".to_string(),
+            skipped: false,
+            index_root: TamePathBuf::new(),
+        };
+        let name_override = RegistryMinPublishAgeOverride {
+            name: "cool-reg".to_string(),
+            index: None,
+            min_publish_age_seconds: Some(24 * 60 * 60),
+            name_from_env: false,
+        };
+        let index_override = RegistryMinPublishAgeOverride {
+            name: "policy-name".to_string(),
+            index: Some("sparse+https://example.com/index/".to_string()),
+            min_publish_age_seconds: Some(0),
+            name_from_env: false,
+        };
+
+        for registries in [
+            vec![name_override.clone(), index_override.clone()],
+            vec![index_override, name_override],
+        ] {
+            let config = Config {
+                min_publish_age_seconds: 14 * 24 * 60 * 60,
+                registry_min_publish_age: RegistryMinPublishAgeConfig {
+                    crates_io_seconds: None,
+                    registries,
+                },
+                incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+                fallback_accept: FallbackAccept::Prompt,
+                lockfile_baseline: LockfileBaselineMode::Floor,
+                now_override: None,
+                ttl_seconds: 60,
+                cache_dir: None,
+                http_retries: 0,
+                verbose: false,
+                skip_registries: Vec::new(),
+                allow_rules: AllowRules::default(),
+            };
+
+            assert_eq!(
+                config
+                    .min_publish_age_seconds_for(&context, "serde")
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_registry_override_name_errors_instead_of_falling_back() {
+        let context = RegistryContext {
+            logical_name: "cool-reg".to_string(),
+            source_id: "sparse+https://example.com/index/".to_string(),
+            effective_index_url: "sparse+https://example.com/index/".to_string(),
+            api: None,
+            cache_fingerprint: "test".to_string(),
+            skipped: false,
+            index_root: TamePathBuf::new(),
+        };
+        let config = Config {
+            min_publish_age_seconds: 0,
+            registry_min_publish_age: RegistryMinPublishAgeConfig {
+                crates_io_seconds: None,
+                registries: vec![RegistryMinPublishAgeOverride {
+                    name: "registry-that-does-not-exist".to_string(),
+                    index: None,
+                    min_publish_age_seconds: Some(24 * 60 * 60),
+                    name_from_env: true,
+                }],
+            },
+            incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+            fallback_accept: FallbackAccept::Prompt,
+            lockfile_baseline: LockfileBaselineMode::Floor,
+            now_override: None,
+            ttl_seconds: 60,
+            cache_dir: None,
+            http_retries: 0,
+            verbose: false,
+            skip_registries: Vec::new(),
+            allow_rules: AllowRules::default(),
+        };
+
+        let err = config
+            .min_publish_age_seconds_for(&context, "serde")
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(
+                "failed to evaluate min-publish-age override for [registries.registry-that-does-not-exist]"
+            ),
+            "{err:#}"
         );
     }
 
