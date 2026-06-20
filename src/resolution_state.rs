@@ -842,7 +842,7 @@ mod tests {
         };
         assert_eq!(origin.requirement_req(), VersionReq::parse("^1").unwrap());
     }
-   
+
     #[test]
     fn find_manifest_dependency_matches_normalized_and_renamed_dependency() {
         let deps = vec![
@@ -855,7 +855,7 @@ mod tests {
                 name: "mio".to_string(),
                 rename: Some("mio-1_0".to_string()),
                 requirement: "^1.0".to_string(),
-            }
+            },
         ];
         // Matches even with hyphen/underscore mismatch and multiple renamed options
         let matched = find_manifest_dependency(&deps, "mio_1_0", "mio")
